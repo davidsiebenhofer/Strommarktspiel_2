@@ -101,6 +101,15 @@ st.session_state.setdefault("hour_index", 0)
 
 # ---------------------- UI --------------------------------------------
 
+def limit_pumpspeicher(qty, storage_level, max_storage):
+    if qty < 0 and storage_level >= max_storage:
+        st.info("Pumpspeicher voll – kann nicht laden!")
+        return 0.0
+    elif qty > 0 and storage_level <= 0:
+        st.info("Pumpspeicher leer – kann nicht entladen!")
+        return 0.0
+    return qty
+
 st.set_page_config(page_title="Merit Order Spiel", layout="wide")
 st.title("🔌 Merit-Order-Spiel")
 
@@ -185,45 +194,76 @@ with col2:
 st.divider()
 st.subheader("Gebote der Erzeuger")
 
-
-def limit_pumpspeicher(qty, storage_level, max_storage):
-    if qty < 0 and storage_level >= max_storage:
-        st.info("Pumpspeicher voll – kann nicht laden!")
-        return 0.0
-    elif qty > 0 and storage_level <= 0:
-        st.info("Pumpspeicher leer – kann nicht entladen!")
-        return 0.0
-    return qty
-
+# Linke Spalte: Geboteingabe | Rechte Spalte: Deckungsanzeige
+col_bids, col_status = st.columns([3, 1])
 
 bids = []
-for p in PRODUCERS:
-    maxcap = caps_default[p][st.session_state.hour_index]*factor
-    cost = cost_default[p]
-    col_a, col_b, col_c = st.columns([3, 2, 2])
-    with col_a:
-        st.write(f"**{p}** — Max: {maxcap if maxcap < 999999 else '∞'} MWh | Kosten: {cost} €/MWh")
-    with col_b:
-        price = st.number_input(f"Preis {p} / €/MWh", value=0.0, key=f"price_{p}")
-    with col_c:
-        qty = st.number_input(
-            f"gebotene Energiemenge {p} / MWh",
-            value=0.0,
-            min_value=-float(maxcap) if p == "Pumpspeicher 1" else 0.0,
-            max_value=float(abs(maxcap)),
-            key=f"qty_{p}"
-        )
-    if p == "Pumpspeicher 1":
-        qty = limit_pumpspeicher(qty, st.session_state.storage_level, max_storage)
-    bids.append({"Producer": p, "Price": price, "Qty": qty, "Cost": cost})
+with col_bids:
+    for p in PRODUCERS:
+        maxcap = caps_default[p][st.session_state.hour_index] * factor
+        cost = cost_default[p]
 
-# Nachfrage sicherstellen
+        col_a, col_b, col_c = st.columns([3, 2, 2])
+        with col_a:
+            st.write(f"**{p}** — Max: {maxcap if maxcap < 999999 else '∞'} MWh | Kosten: {cost} €/MWh")
+        with col_b:
+            price = st.number_input(
+                f"Preis {p} / €/MWh",
+                value=0.0,
+                key=f"bids_price_{p}"
+            )
+        with col_c:
+            qty = st.number_input(
+                f"gebotene Energiemenge {p} / MWh",
+                value=0.0,
+                min_value=-float(maxcap) if p == "Pumpspeicher 1" else 0.0,
+                max_value=float(abs(maxcap)),
+                key=f"bids_qty_{p}"
+            )
 
-if sum(b["Qty"] for b in bids if b["Qty"] > 0) < demand_default[hour]:
-    missing = demand_default[hour] - sum(b["Qty"] for b in bids if b["Qty"] > 0)
+        if p == "Pumpspeicher 1":
+            qty = limit_pumpspeicher(qty, st.session_state.storage_level, max_storage)
+
+        bids.append({"Producer": p, "Price": price, "Qty": qty, "Cost": cost})
+
+with col_status:
+    st.markdown("**Deckung der Nachfrage**")
+    demand_now = demand_default[hour]
+
+    # Angebot (nur positive Mengen zählen als Erzeugung)
+    supply_now = sum(max(0.0, b["Qty"]) for b in bids)
+
+    # Pumpspeicher-Ladeleistung erhöht die Nachfrage
+    pump_load = sum(-b["Qty"] for b in bids if b["Producer"] == "Pumpspeicher 1" and b["Qty"] < 0)
+
+    # Immer berücksichtigen
+    effective_demand = demand_now + pump_load
+
+    target = max(effective_demand, 0.0)
+    covered = min(supply_now, target)
+
+    coverage = (covered / target) if target > 0 else 1.0
+    coverage = float(max(0.0, min(coverage, 1.0)))
+
+    st.metric("Effektive Nachfrage (akt. Stunde)", f"{effective_demand:.0f} MWh")
+    st.metric("Angebot (positiv)", f"{supply_now:.0f} MWh")
+    st.progress(coverage)
+
+    if target == 0:
+        st.info("Keine Nachfrage in dieser Stunde.")
+    elif supply_now < target:
+        st.warning(f"Noch offen: {(target - supply_now):.0f} MWh")
+    else:
+        st.success("Voll gedeckt")
+
+# Nachfrage sicherstellen (Fallback auf Gas 1)
+# Optional: nutze effective_demand statt demand_now, wenn du das Laden des Pumpspeichers abdecken willst
+missing = demand_default[hour] - sum(max(0.0, b["Qty"]) for b in bids)
+if missing > 0:
     for b in bids:
-        if b["Producer"] == "Gas":
+        if b["Producer"] == "Gas 1":
             b["Qty"] += missing
+            break
 
 # ---------------- Berechnung Merit Order ----------------
 
@@ -298,11 +338,24 @@ if st.button("Los! Merit Order berechnen"):
         st.dataframe(result.style.format(
             {"Price": "{:.2f}", "Qty": "{:.1f}", "Dispatched": "{:.1f}", "Revenue": "{:.2f}", "Profit": "{:.2f}"}))
 
+
 st.divider()
 st.subheader("Bisherige Gewinne / €")
-profit_df = pd.DataFrame({"Erzeuger": list(st.session_state.profits.keys()),
-                          "Gewinn / €": list(st.session_state.profits.values())})
-st.table(profit_df)
+
+profit_df = pd.DataFrame({
+    "Erzeuger": list(st.session_state.profits.keys()),
+    "Gewinn / €": list(st.session_state.profits.values())
+})
+
+# Für die Anzeige: keine Nachkommastellen und Punkt als Tausendertrennzeichen
+display_df = profit_df.copy()
+display_df["Gewinn / €"] = (
+    display_df["Gewinn / €"]
+    .round(0).astype(int)                       # keine Nachkommastellen
+    .map(lambda v: f"{v:,}".replace(",", "."))  # 1.234.567
+)
+
+st.table(display_df)
 
 if st.button("Neuer Tag starten"):
     st.session_state.profits = {p: 0.0 for p in PRODUCERS}
